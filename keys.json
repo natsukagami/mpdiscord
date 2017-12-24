@@ -1,9 +1,13 @@
 {
-  "appClientID": "385061381344591872",
+  "appClientID": "394320544960479232",
   "imageKeys": {
     "large": "spotify",
     "small": "play_button_clean",
     "smallPaused": "pause_button_clean"
   },
-  "rpcTransportType": "ipc"
+  "rpcTransportType": "ipc",
+  "mpd": {
+    "host": "localhost",
+    "port": 6600
+  }
 }

@@ -1,90 +1,74 @@
-const { Client } = require('discord-rpc'),
-      spotifyWeb = require('./spotify'),
-      log = require("fancy-log"),
-      events = require('events'),
-      fs = require('fs'),
-      keys = require('./keys.json');
+const {
+  Client
+} = require('discord-rpc');
+const mpd = require('mpd');
+const log = require("fancy-log");
+const events = require('events');
+const keys = require('./keys.json');
 
-/**
- * Check if user is blocking open.spotify.com before establishing RPC connection
- * Works only on Linux based systems that use /etc/hosts, if a rule exist, the
- * user will be in loop of ECONNRESET [changed address]:80 or recieve false data.
- **/
-function checkHosts(file) {
-  if (file.includes("open.spotify.com")) throw new Error("Arr' yer be pirating, please remove \"open.spotify.com\" rule from your hosts file.");
-}
-if (process.platform !== "win32" && fs.existsSync("/etc/hosts")) {
-  checkHosts(fs.readFileSync("/etc/hosts", "utf-8"));
-}
-
-const rpc = new Client({ transport: keys.rpcTransportType }),
-      s = new spotifyWeb.SpotifyWebHelper(),
-      appClient = keys.appClientID,
-      largeImageKey = keys.imageKeys.large,
-      smallImageKey = keys.imageKeys.small,
-      smallImagePausedKey = keys.imageKeys.smallPaused;
+const rpc = new Client({
+    transport: keys.rpcTransportType
+  }),
+  appClient = keys.appClientID;
 
 var songEmitter = new events.EventEmitter(),
-    currentSong = {};
+  currentSong = {};
 
-async function spotifyReconnect () {
-  s.getStatus(function(err, res) {
-    if (!err) {
-      clearInterval(check);
-      global.intloop = setInterval(checkSpotify, 1500);
-    }
-  });
+const client = mpd.connect(keys.mpd);
+
+const exit = (err) => {
+  if (err)
+    log(err);
+  log("Connection to mpd ended. Exiting...");
+  process.exit(0);
 }
 
-async function checkSpotify() {
-  s.getStatus(function (err, res) {
-    if (err) {
-      if (err.code === "ECONNREFUSED") {
-        if (err.address === "127.0.0.1" && err.port === 4381) {
-            /**
-             * Temporary workaround - to truly fix this, we need to change spotify.js to check for ports above 4381 to the maximum range.
-             * This is usually caused by closing Spotify and reopening before the port stops listening. Waiting about 10 seconds should be
-             * sufficient time to reopen the application.
-             **/
-            log.error("Spotify seems to be closed or unreachable on port 4381! Close Spotify and wait 10 seconds before restarting for this to work. Checking every 5 seconds to check if you've done so.");
-            clearInterval(intloop);
-            global.check = setInterval(spotifyReconnect, 5000);
-	      }
-      } else {
-          log.error("Failed to fetch Spotify data:", err);
-      }
-      return;
+function ObjectFromArray(entries) {
+  const obj = {};
+  for (let item of entries) {
+    obj[item[0]] = item[1];
+  }
+  return obj;
+}
+
+/**
+ * Parses mpd output into an object
+ * @param {string} str 
+ */
+function parseOutput(str) {
+  return ObjectFromArray(str.split('\n').map(s => {
+    const firstMark = s.search(':');
+    if (firstMark === -1) return undefined;
+    return [s.slice(0, firstMark), s.slice(firstMark + 2)];
+  }).filter(s => s !== undefined));
+}
+
+// Kill the client if there's no mpd / mpd disconnected
+client.on('end', exit);
+
+function checkMPD() {
+  client.sendCommand(mpd.cmd('status', []), (err, out) => {
+    if (err) exit();
+    const status = parseOutput(out);
+    if (status.state === 'stop') {
+      songEmitter.emit('stop');
+    } else {
+      client.sendCommand(mpd.cmd('currentsong', []), (err, oSong) => {
+        const song = parseOutput(oSong);
+        // console.log(song);
+        // console.log(status);
+        songEmitter.emit('song', {
+          title: song.Title,
+          artist: song.Artist,
+          album: song.Album,
+          track: song.Track || 1,
+          length: Number(song.duration),
+          current: Number(status.elapsed),
+          date: song.Date.split(' '),
+          playing: status.state === 'play'
+        });
+      });
     }
-
-    if (!res.track.track_resource || !res.track.artist_resource) return;
-
-    if (currentSong.uri && res.track.track_resource.uri == currentSong.uri && (res.playing != currentSong.playing)) {
-      currentSong.playing = res.playing;
-      currentSong.position = res.playing_position;
-      songEmitter.emit('songUpdate', currentSong);
-      return;
-    }
-
-    if (res.track.track_resource.uri == currentSong.uri) return;
-
-    let start = parseInt(new Date().getTime().toString().substr(0, 10)),
-        end = start + (res.track.length - res.playing_position);
-    
-    var song = {
-      uri: (res.track.track_resource.uri ? res.track.track_resource.uri : ""),
-      name: res.track.track_resource.name,
-      album: (res.track.album_resource ? res.track.album_resource.name : ""),
-      artist: (res.track.artist_resource ? res.track.artist_resource.name : ""),
-      playing: res.playing,
-      position: res.playing_position,
-      length: res.track.length,
-      start,
-      end
-    };
-    
-    currentSong = song;
-
-    songEmitter.emit('newSong', song);
   });
 }
 
@@ -93,48 +77,43 @@ async function checkSpotify() {
  * newSong: gets emitted when the song changes to update the RP
  * songUpdate: currently gets executed when the song gets paused/resumes playing.
  **/
-songEmitter.on('newSong', song => {
+songEmitter.on('song', song => {
+  const ImageKey = song.playing ? 'play' : 'pause';
+  const start = song.playing ? (new Date().getTime() / 1000) - song.current : undefined;
+  const end = song.playing ? start + song.length : undefined;
+
   rpc.setActivity({
-    details: `🎵  ${song.name}`,
+    details: `🎵  ${song.title}`,
     state: `👤  ${song.artist}`,
-    startTimestamp: song.start,
-    endTimestamp: song.end,
-    largeImageKey,
-    smallImageKey,
-    largeImageText: `⛓  ${song.uri}`,
+    startTimestamp: start,
+    endTimestamp: end,
+    largeImageKey: ImageKey + '_large',
+    smallImageKey: ImageKey + '_small',
+    largeImageText: `💿 Track #${song.track} from ${song.album}`,
     smallImageText: `💿  ${song.album}`,
     instance: false,
-  });
+  }).catch(log);
 
-  log(`Updated song to: ${song.artist} - ${song.name}`);
+  log(`Updated song to: ${song.artist} - ${song.title} (song playing = ${song.playing ? 'yes' : 'no'})`);
 });
 
-songEmitter.on('songUpdate', song => {
-  let startTimestamp = song.playing ?
-    parseInt(new Date().getTime().toString().substr(0, 10)) - song.position :
-    undefined,
-    endTimestamp = song.playing ?
-    startTimestamp + song.length :
-    undefined;
-
+songEmitter.on('stop', () => {
   rpc.setActivity({
-    details: `🎵  ${song.name}`,
-    state: `👤  ${song.artist}`,
-    startTimestamp,
-    endTimestamp,
-    largeImageKey,
-    smallImageKey: startTimestamp ? smallImageKey : smallImagePausedKey,
-    largeImageText: `⛓  ${song.uri}`,
-    smallImageText: `💿  ${song.album}`,
+    details: `🎵  Nothing is playing`,
+    state: `mpd stopped`,
+    largeImageKey: 'stop_large',
+    smallImageKey: 'stop_small',
     instance: false,
   });
-
-  log(`Song state updated (playing: ${song.playing})`)
+  log(`mpd stopped`);
 });
 
 rpc.on('ready', () => {
-    log(`Connected to Discord! (${appClient})`);
-    global.intloop = setInterval(checkSpotify, 1500);
+  log(`Connected to Discord! (${appClient})`);
+  // Run initially
+  checkMPD();
+
+  client.on('system-player', checkMPD);
 });
 
 rpc.login(appClient).catch(log.error);
